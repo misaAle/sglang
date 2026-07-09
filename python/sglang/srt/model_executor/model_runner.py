@@ -327,6 +327,8 @@ class ModelRunnerOutput:
     expert_distribution_metrics: Optional[ExpertDistributionMetrics] = None
     routed_experts_output: Optional[TopkCaptureOutput] = None
     indexer_topk_output: Optional[TopkCaptureOutput] = None
+    # Decode graphs use padded batch size; prefill graphs use padded token count.
+    cuda_graph_batch: Optional[int] = None
 
 
 class ModelRunner(ModelRunnerKVCacheMixin):
@@ -3028,7 +3030,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             output.routed_experts_output = experts_capturer.on_forward_end(
                 forward_batch=forward_batch,
                 can_run_graph=output.can_run_graph,
-                cuda_graph_batch=getattr(self.decode_cuda_graph_runner, "bs", None),
+                cuda_graph_batch=output.cuda_graph_batch,
                 no_copy_to_cpu=no_copy_to_cpu,
             )
 
@@ -3036,7 +3038,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             output.indexer_topk_output = indexer_capturer.on_forward_end(
                 forward_batch=forward_batch,
                 can_run_graph=output.can_run_graph,
-                cuda_graph_batch=getattr(self.decode_cuda_graph_runner, "bs", None),
+                cuda_graph_batch=output.cuda_graph_batch,
                 no_copy_to_cpu=no_copy_to_cpu,
             )
 
@@ -3140,7 +3142,13 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                     forward_batch,
                     pp_proxy_tensors=pp_proxy_tensors,
                 )
-                return ModelRunnerOutput(logits_output=ret, can_run_graph=can_run_graph)
+                return ModelRunnerOutput(
+                    logits_output=ret,
+                    can_run_graph=can_run_graph,
+                    cuda_graph_batch=getattr(self.decode_cuda_graph_runner, "bs", None),
+                )
+
+            cuda_graph_batch = None
 
             # DP / MLP-sync padding + attn-tp normalization. Only the decode
             # cuda-graph path above pre-pads its static buffers and returns
@@ -3188,6 +3196,9 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                         forward_batch, **kwargs
                     )
                 can_run_graph = True
+                cuda_graph_batch = getattr(
+                    self.prefill_cuda_graph_runner, "_static_num_tokens", None
+                )
             else:
                 # Eager: decode / extend / idle dispatched inside the runner.
                 ret = self.eager_runner.execute(
@@ -3200,7 +3211,11 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             ):
                 forward_batch.post_forward_mlp_sync_batch(ret)
 
-            return ModelRunnerOutput(logits_output=ret, can_run_graph=can_run_graph)
+            return ModelRunnerOutput(
+                logits_output=ret,
+                can_run_graph=can_run_graph,
+                cuda_graph_batch=cuda_graph_batch if can_run_graph else None,
+            )
 
     def _preprocess_logits(
         self, logits_output: LogitsProcessorOutput, sampling_info: SamplingBatchInfo
